@@ -1,0 +1,314 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+	<title>Beaver's Nanny</title>
+	<link rel="stylesheet" type="text/css" href="style/main.css">
+	<script type="text/javascript" src="js/jquery-2.2.0.min.js"></script>
+	<script type="text/javascript">
+	function setStatus(text, warning)
+	{
+		if (warning)
+			$("#statusText").addClass('warning');
+		else
+			$("#statusText").removeClass('warning');
+		$("#statusText").text(text);
+		
+	}
+	
+	$(document).ready(function(){
+		// Constants
+		var wsIP = location.hostname;//'192.168.1.3';
+		var wsPort = 8888;
+		var mjpegPort = 8889;
+		var channels = 2;
+		var sampleRate = 44100; 
+		
+		$("#statusIP").text(wsIP);
+
+		/*
+		 * Initialization
+		 */
+	
+		// Create audio context.
+		try {
+			var audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+			if (!audioCtx) 
+				throw new Error("No audio API found.");
+
+			if (!"WebSocket" in window)
+				throw new Error("No WebSocket interface found.");
+		}
+		catch (e) {
+			alert(e);
+			return;
+		}
+				
+		
+		/*
+		 * Web Socket Control
+		 */
+		var ws = null;
+		wsMonitor = window.setInterval(function(){
+			if (!ws)
+				wsConnect();
+			else
+				getStatus();
+		}, 5000);
+		
+		
+		var wsCommand = null;
+		var wsCommandCounter = 1;
+		var wsAudioBytesRecvHistory = [];
+		var wsAudioBytesRecv = 0;
+
+		window.setInterval(function(){
+			if (!ws) return;
+			wsAudioBytesRecvHistory.push(wsAudioBytesRecv);
+			wsAudioBytesRecv = 0;
+			while (wsAudioBytesRecvHistory.length > 5)
+				wsAudioBytesRecvHistory.shift();
+			
+			if (wsAudioBytesRecvHistory.length == 5) {
+				let sum = wsAudioBytesRecvHistory.reduce(function(pv, cv) { return pv + cv; }, 0);
+				let avg = sum / wsAudioBytesRecvHistory.length;
+				$("#audioText").text(Math.round(avg / 1024) + " kB/s");
+				if (avg < 10000) {
+					// Alert, the audio signal is not getting through!
+					$("#controlPanel").addClass("audioAlert");
+					$("#audioText").addClass("warning");
+				}
+				else {
+					$("#controlPanel").removeClass("audioAlert");
+					$("#audioText").removeClass("warning");
+				}
+			}
+		}, 1000);
+		
+		/**
+		 * Connect function initializes the WebSocket connection
+		 * and the audio receiver.
+		 */
+		function wsConnect() {
+			if (ws) return;
+			setStatus('connecting...');
+			
+			/*
+			 * Audio Playback
+			 */
+			var nextTime = 0;
+			function enqueueAudioData(dataArrayBuffer)
+			{
+				var data = new Int16Array(dataArrayBuffer);
+				wsAudioBytesRecv += data.length * 2;	// len in bytes
+				var samples = data.length/2;
+				var buf = audioCtx.createBuffer(2, samples, sampleRate);
+				var left = buf.getChannelData(0);
+				var right = buf.getChannelData(1);
+
+				var i2 = 0;
+				for (var i = 0; i < samples; ++i) {
+					left[i] = data[i2++] / 32768;
+					right[i] = data[i2++] / 32768;
+				}
+				
+				if (nextTime == 0)
+					nextTime = audioCtx.currentTime + 0.05;
+				
+				var source = audioCtx.createBufferSource();
+				source.buffer = buf;
+				source.connect(audioCtx.destination);
+				source.start(nextTime);
+
+				nextTime += buf.duration;				
+			}
+			
+
+			try {
+				ws = new WebSocket('ws://' + wsIP + ':' + wsPort + '/', 'nanny-basic');
+				ws.binaryType = "arraybuffer";
+				ws.onopen = function(e) {
+					setStatus('online');
+					$('#videoPanel').show();
+					getStatus();
+				};
+				
+				ws.onmessage = function(e) {
+					if (e.data instanceof ArrayBuffer) {
+						enqueueAudioData(e.data);
+					}
+					else {
+						if (!wsCommand) return;
+						var cmdRes = JSON.parse(e.data);
+						if (!cmdRes || (!cmdRes.res && !cmdRes.error)) return;
+						
+						var cmd = wsCommand;
+						wsCommand = null;
+						
+						if (cmdRes.error)
+							cmd.error(cmdRes.error);
+						else
+							cmd.success(cmdRes.res);
+					}
+				};
+				
+				ws.onclose = function(e) {
+					ws = wsCommand = null;
+					
+					setStatus('offline', true);
+					$("#audioText").text('-');
+					wsAudioBytesRecv = 0;
+					wsAudioBytesRecvHistory = [];
+					
+					$('#videoPanel').hide();
+					$('#videoImg').attr('src', 'style/offline.jpg');
+
+					//if (!e.wasClean) {}
+				};
+			}
+			catch (e) {
+				setStatus('offline', true);
+			}
+		}
+		
+		
+		function sendCommand(command, args, success, error)
+		{
+			if (!ws)
+				throw new Error("WebSocket connection is not established.");
+				
+			if (wsCommand) {
+				window.setTimeout(function(){
+					error("Another command pending...");
+				}, 0);
+				return;
+			}
+			
+			var cmd = {
+				id: wsCommandCounter++,
+				command: command,
+				args: args,
+			};
+			
+			wsCommand = {
+				command: cmd,
+				success: success,
+				error: error,
+			};
+			ws.send(JSON.stringify(cmd));
+		}
+		
+		
+		var videoStreamActive = false;	// whether video stream has been activated
+
+		function _setVideoStream(vidStr)
+		{
+			if (videoStreamActive = vidStr)
+				$('#videoImg').attr('src', 'http://' + wsIP + ':' + mjpegPort + '/?action=stream');				
+			else
+				$('#videoImg').attr('src', 'style/offline.jpg');
+				
+			$("#statusVideo").text(videoStreamActive ? 'on' : 'off');
+		}
+
+		function getStatus()
+		{
+			if (!ws || wsCommand) return;
+			sendCommand('getStatus', [],
+				function(res){
+					_setVideoStream(res.video);
+				}, null);
+		}
+		
+		
+		
+		/*
+		 * UI Handlers
+		 */
+
+		// Button handlers.		
+		$('#videoImg').click(function(){
+			if (!ws || wsCommand) return;
+			sendCommand(videoStreamActive ? 'stopVideo' : 'startVideo', [],
+				function(res){
+					_setVideoStream(res.video);
+				},
+				function(msg){
+					alert(msg);
+				});
+		});
+		
+		// Finally try to connect ...
+		wsConnect();
+		
+		function updateImagePosition() {
+			let aspect = $("#videoPanel").width() / $("#videoPanel").height();
+			let goodAspect = 640/480;
+			if (aspect > goodAspect) {
+				// wider than taller -> set margins on left and right.
+				var hmargin = 1 - goodAspect / aspect;
+				var vmargin = 0;
+			}
+			else {
+				// wider than taller -> set margins on left and right.
+				var hmargin = 0;
+				var vmargin = 1 - aspect / goodAspect;
+			}
+			// wider than taller -> set margins on left and right.
+			$("#videoPanel > div").css("top", vmargin*50 + "%");
+			$("#videoPanel > div").css("bottom", vmargin*50 + "%");
+			$("#videoPanel > div").css("left", hmargin*50 + "%");
+			$("#videoPanel > div").css("right", hmargin*50 + "%");
+		}
+
+		$(window).resize(updateImagePosition);
+		updateImagePosition();
+		
+		window.addEventListener("beforeunload", function() {
+			setStatus('closing...');
+			if (wsMonitor) {
+				window.clearInterval(wsMonitor);
+				wsMonitor = null;
+			}
+			if (ws) {
+				ws.onclose = function(){};
+				ws.close();
+			}
+		})
+	});
+	</script>
+</head>
+
+<body>
+
+
+<div id="controlPanel"><div>
+	<h1>Beaver's Nanny</h1>
+	<table>
+		<tr>
+			<td>IP:</td>
+			<td id="statusIP">192.168.1.3</td>
+		</tr>
+		<tr>
+			<td>port:</td>
+			<td id="statusPort">8888</td>
+		</tr>
+		<tr>
+			<td>status:</td>
+			<td id="statusText" class="warning">offline</td>
+		</tr>
+		<tr>
+			<td>audio:</td>
+			<td id="audioText">-</td>
+		</tr>
+		<tr>
+			<td>video:</td>
+			<td id="statusVideo">off</td>
+		</tr>
+	</table>
+</div></div>
+
+<div id="videoPanel"><div><img id="videoImg" src="style/offline.jpg" title="Click to start/stop video."></div></div>
+
+</body>
+</html>
